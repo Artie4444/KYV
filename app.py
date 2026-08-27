@@ -1,6 +1,8 @@
 import html
 import re
 import time
+import unicodedata
+import json
 from datetime import datetime
 from io import BytesIO
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
@@ -10,6 +12,7 @@ import requests
 import streamlit as st
 import urllib3
 import bing
+from bs4 import BeautifulSoup
 
 try:
     from reportlab.lib import colors
@@ -154,6 +157,120 @@ def clean_text(value: str) -> str:
     return normalize_whitespace(html.unescape(value))
 
 
+def strip_trailing_ellipsis(value: str) -> str:
+    """Remove trailing ellipsis or repeated dot characters commonly added by RSS/snippet feeds.
+
+    Examples: "...", "…", "...." at the end of a snippet.
+    """
+    if not value:
+        return ""
+
+    # Normalize and remove trailing runs of dots or ellipsis characters
+    value = value.strip()
+    # Remove Unicode ellipsis and multiple dot sequences at end
+    value = re.sub(r"[\u2026]+$", "", value)
+    value = re.sub(r"[.]{2,}$", "", value)
+    return value.strip()
+
+
+def sanitize_text(value: str) -> str:
+    """Normalize and clean text to avoid common mojibake and control characters.
+
+    This attempts to fix typical encoding artifacts such as smart quotes
+    rendered as sequences like "â€™" and removes non-printable control
+    characters. It's intentionally conservative to avoid altering meaning.
+    """
+    if not value:
+        return ""
+
+    # Decode HTML entities and normalize Unicode form
+    text = html.unescape(value)
+    text = unicodedata.normalize("NFKC", text)
+
+    # Replace common mojibake sequences returned by some feeds/APIs
+    replacements = {
+        "â€™": "'",
+        "â€˜": "'",
+        "â€œ": '"',
+        "â€�": '"',
+        "â€“": "-",
+        "â€”": "-",
+        "Ã©": "é",
+        "Ã±": "ñ",
+        "â€¦": "...",
+    }
+
+    for k, v in replacements.items():
+        if k in text:
+            text = text.replace(k, v)
+
+    # Map common Unicode curly quotes to ASCII equivalents
+    unicode_quote_map = {
+        "\u2019": "'",
+        "\u2018": "'",
+        "\u201B": "'",
+        "\u201A": "'",
+        "\u201C": '"',
+        "\u201D": '"',
+        "\u201E": '"',
+        "\u201F": '"',
+    }
+    for k, v in unicode_quote_map.items():
+        if k in text:
+            text = text.replace(k, v)
+
+    # Remove control characters except whitespace-like ones
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]+", "", text)
+
+    # Fix lone replacement-question-marks that often appear where an
+    # apostrophe/typographic quote belonged. Replace only when the
+    # question mark appears inside a word or before a capitalised word
+    # (common in names), to avoid changing real sentence-ending ? marks.
+    text = re.sub(r"(?<=\w)\?(?=\w)", "'", text)
+    text = re.sub(r"(?<=\w)\?(?=\s[A-Z])", "'", text)
+    # Also handle Unicode replacement char (U+FFFD) in the same positions.
+    text = re.sub(r"(?<=\w)\uFFFD(?=\w)", "'", text)
+    text = re.sub(r"(?<=\w)\uFFFD(?=\s[A-Z])", "'", text)
+
+    # Also convert question marks that directly follow a word and are
+    # followed by whitespace (common in truncated/encoded snippets)
+    text = re.sub(r"(?<=\w)\?(?=\s)", "'", text)
+    # And question marks that appear after whitespace before a word
+    # (e.g. 'Dato ?Najib') -> "Dato 'Najib".
+    text = re.sub(r"(?<=\s)\?(?=\w)", "'", text)
+
+    # Fallback: if any single non-word punctuation sits between letters
+    # (e.g. unusual encoding artifact displayed as a punctuation glyph),
+    # conservatively convert it to an apostrophe.
+    text = re.sub(r"(?<=\w)[^\w\s](?=\w)", "'", text)
+    text = re.sub(r"(?<=\w)[^\w\s](?=\s[A-Z])", "'", text)
+
+    # Normalize repeated whitespace
+    text = normalize_whitespace(text)
+
+    return text
+
+
+def prepare_snippet_for_display(snippet: str) -> str:
+    """Normalize a snippet for UI/PDF display and append an ellipsis if appropriate.
+
+    - Decodes HTML entities and normalizes whitespace.
+    - Removes existing trailing ellipsis characters or repeated dots.
+    - Appends a single space + three dots (` ...`) if the snippet doesn't already
+      end with sentence punctuation or an ellipsis.
+    """
+    s = sanitize_text(snippet or "")
+    s = strip_trailing_ellipsis(s)
+    if not s:
+        return ""
+
+    # If it already ends with punctuation or an ellipsis, leave as-is.
+    if re.search(r"(\.{3}|\u2026|[.!?])$", s):
+        return s
+
+    return s + " ..."
+
+
 def format_keyword_for_search(keyword: str) -> str:
     """
     Format a keyword for use in the Boolean search expression.
@@ -272,6 +389,33 @@ def find_keyword_hits(text: str, keywords: list[str]) -> list[str]:
     ]
 
 
+def is_msn_result(result: dict) -> bool:
+    """Return True if the search result appears to be from MSN.
+
+    We check several result fields (link, snippet, title, source/publisher)
+    for MSN indicators so aggregated or redirected MSN items are caught.
+    """
+    # Check link first (covers direct MSN URLs and common redirects)
+    link = (result.get("link") or "").strip()
+    try:
+        if link:
+            if "msn.com" in link.lower() or "msn." in urlparse(link).netloc.lower():
+                return True
+    except Exception:
+        pass
+
+    # Check snippet, title, or source fields for explicit 'MSN' publisher text.
+    snippet = (result.get("snippet") or "").strip()
+    title = (result.get("title") or "").strip()
+    source = (result.get("source") or result.get("publisher") or "").strip()
+
+    for text in (snippet, title, source):
+        if re.search(r"\bmsn\b", text, flags=re.IGNORECASE):
+            return True
+
+    return False
+
+
 def assess_article_aml_risk(result: dict) -> dict:
     """
     Assign a screening risk flag using the article title and snippet only.
@@ -382,6 +526,7 @@ def generate_vendor_screening_pdf(
     subject: str,
     results: list[dict],
     assessments: list[dict],
+    include_ai_summary: bool = False,
 ) -> bytes:
     """
     Generate a vendor AML screening report listing every collected article.
@@ -656,12 +801,25 @@ def generate_vendor_screening_pdf(
                 f"{pdf_safe_text(assessment['onboarding_recommendation'])}",
                 styles["VendorBody"],
             ),
-            Paragraph(
-                f"<b>Search-result snippet:</b> "
-                f"{pdf_safe_text(result['snippet'] or 'No snippet available.')}",
-                styles["VendorBody"],
-            ),
         ]
+
+        # Include either the snippet or the AI summary based on caller preference
+        if include_ai_summary:
+            article_flowables.append(
+                Paragraph(
+                    f"<b>AI summary:</b> {pdf_safe_text(result.get('summary', '') or 'No summary generated.')}",
+                    styles["VendorBody"],
+                )
+            )
+        else:
+            snippet_display = prepare_snippet_for_display(result.get('snippet', '') or '') or 'No snippet available.'
+            article_flowables.append(
+                Paragraph(
+                    f"<b>Search-result snippet:</b> "
+                    f"{pdf_safe_text(snippet_display)}",
+                    styles["VendorBody"],
+                )
+            )
         safe_link = pdf_safe_text(result["link"])
         article_flowables.append(
             Paragraph(
@@ -699,6 +857,163 @@ def generate_vendor_screening_pdf(
     )
 
     return buffer.getvalue()
+
+
+def simple_local_summary(text: str, max_sentences: int = 3) -> str:
+    """Create a short heuristic summary by taking the first few sentences."""
+    if not text:
+        return ""
+    # Normalize whitespace and split on sentence-like punctuation.
+    text = clean_text(text)
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chosen = sentences[:max_sentences]
+    summary = " ".join(chosen).strip()
+    # Fallback to truncation if no sentences found.
+    if not summary:
+        return text[:300].strip()
+    return summary
+
+
+def summarize_with_gemini(text: str, api_key: str, model: str = "models/gemini-3.5-flash-lite", timeout: int = 15) -> str:
+    """Call a Vertex/Gemini-style REST endpoint to generate a concise summary.
+
+    This implementation uses the Google Generative Language REST pattern:
+    POST https://generativelanguage.googleapis.com/v1beta2/{model}:generateText
+
+    If the request fails or the response shape is unexpected, an exception is raised.
+    """
+    if not text:
+        return ""
+
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta2/{model}:generateText"
+    # prompt = (
+    #     "Provide a concise summary of the following article in 2-3 sentences. "
+
+    # )
+    
+    prompt = (
+        "You are a concise compliance assistant. Read the full article text below and produce a clear, "
+        "human-friendly 2–3 sentence summary focused on any misconduct, investigations, legal action, "
+        "or regulatory matters. Do not copy full sentences from the article. Paraphrase and synthesize "
+        "the information in your own words. Follow these rules:\n"
+        "- Produce exactly 2–3 short sentences.\n"
+        "- Sentence 1: State the main point (what happened).\n"
+        "- Sentence 2: Provide key specifics (who, what, when, where) if available.\n"
+        "- Optional Sentence 3: One short implication or current status (e.g., 'under investigation', 'charged', 'settled').\n"
+        "- Prioritize facts about investigations, charges, regulatory actions, fines, arrests, or legal outcomes; omit generic background context.\n"
+        "- If the article lacks concrete details, write 'no details provided'.\n"
+        "- Do not include quotes, verbatim sentences, or extra commentary. Output the summary only.\n\n"
+        "Important: Do NOT simply repeat the article's first paragraph — synthesize across the full text and avoid verbatim copying.\n\n"
+        "Article:\n\n"
+        + text
+        + "\n\nProvide the summary only (no extra commentary)."
+    )
+    
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    body = {
+        "prompt": {"text": prompt},
+        "temperature": 0.0,
+        "maxOutputTokens": 180,
+    }
+
+    resp = requests.post(endpoint, headers=headers, json=body, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Try common response shapes.
+    # Older PaLM/Generative API used 'candidates'[0]['output'] or 'candidates'[0]['content']
+    if isinstance(data, dict):
+        # 'candidates' style
+        if "candidates" in data and data["candidates"]:
+            first = data["candidates"][0]
+            for key in ("output", "content", "text"):
+                if key in first:
+                    return first[key].strip()
+        # 'results' or 'outputs' style
+        for arr_key in ("results", "outputs"):
+            if arr_key in data and data[arr_key]:
+                first = data[arr_key][0]
+                for key in ("content", "text", "output"):
+                    if key in first:
+                        # some shapes use first['content'][0]['text']
+                        if isinstance(first[key], list) and first[key]:
+                            candidate = first[key][0]
+                            if isinstance(candidate, dict) and "text" in candidate:
+                                return candidate["text"].strip()
+                            return str(candidate).strip()
+                        return str(first[key]).strip()
+
+    # If not returned yet, raise to let caller fallback.
+    raise RuntimeError("Unexpected Gemini response shape: %s" % json.dumps(data)[:1000])
+
+
+def fetch_article_text(url: str, verify_ssl: bool = True, timeout: int = 10) -> str:
+    """Fetch an article URL and extract the main textual content.
+
+    Strategy:
+    - Prefer content inside an <article> tag.
+    - Otherwise, choose the parent element that contains the largest
+      combined length of <p> text nodes.
+    """
+    if not url:
+        return ""
+
+    try:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            )
+        }
+        resp = requests.get(url, headers=headers, timeout=timeout, verify=verify_ssl)
+        resp.raise_for_status()
+        html_text = resp.text
+    except Exception:
+        return ""
+
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        # Remove script/style and irrelevant tags
+        for tag in soup(["script", "style", "noscript", "iframe", "footer", "nav", "header", "aside"]):
+            tag.decompose()
+
+        # Prefer <article>
+        article_tag = soup.find("article")
+        if article_tag:
+            paragraphs = [p.get_text(" ", strip=True) for p in article_tag.find_all("p")]
+            text = "\n\n".join([p for p in paragraphs if p])
+            if len(text) > 200:
+                return normalize_whitespace(text)
+
+        # Otherwise pick the parent with largest combined <p> text
+        p_tags = soup.find_all("p")
+        if not p_tags:
+            # Fallback: whole page text
+            return normalize_whitespace(soup.get_text(" ", strip=True))[:5000]
+
+        parent_scores = {}
+        for p in p_tags:
+            parent = p.find_parent()
+            if parent is None:
+                continue
+            parent_key = id(parent)
+            parent_scores.setdefault(parent_key, {"parent": parent, "length": 0, "texts": []})
+            text = p.get_text(" ", strip=True)
+            parent_scores[parent_key]["length"] += len(text)
+            parent_scores[parent_key]["texts"].append(text)
+
+        best = max(parent_scores.values(), key=lambda v: v["length"])
+        combined = "\n\n".join(best["texts"]) if best and best.get("texts") else ""
+        return normalize_whitespace(combined)[:5000]
+    except Exception:
+        return ""
 
 
 # Article Assistant removed per user request.
@@ -750,13 +1065,14 @@ def convert_results_to_csv(results: list[dict]) -> bytes:
             "title": result["title"],
             "link": result["link"],
             "snippet": result["snippet"],
+            "summary": result.get("summary", ""),
         }
         for result in results
     ]
 
     dataframe = pd.DataFrame(
         export_rows,
-        columns=["title", "link", "snippet"]
+        columns=["title", "link", "snippet", "summary"]
     )
 
     return dataframe.to_csv(
@@ -797,6 +1113,34 @@ st.warning(
     "containing a risk-related keyword does not prove misconduct. "
     "Always open the source and verify the full article."
 )
+
+# Results mode controls are outside the form so they update immediately when changed.
+results_mode = st.radio(
+    label="Results mode",
+    options=["Get all results", "Limit results"],
+    index=0,
+    help=(
+        "Choose 'Get all results' to collect everything from the "
+        "search provider, or choose 'Limit results' to enter a maximum."
+    ),
+    key="results_mode",
+)
+
+# Only show the maximum results input when the user chooses to limit results.
+requested_results = st.session_state.get("requested_results", 10)
+if results_mode == "Limit results":
+    requested_results = st.number_input(
+        label="Maximum number of articles",
+        min_value=1,
+        max_value=10000,
+        value=requested_results,
+        step=10,
+        help=(
+            "The application stops when it reaches this number "
+            "or when the search provider has no more results."
+        ),
+        key="requested_results",
+    )
 
 with st.form("article_search_form"):
 
@@ -859,26 +1203,7 @@ with st.form("article_search_form"):
         key="final_query_preview",
     )
 
-    # Let the user choose to collect all results or enter a maximum.
-    collect_all = st.checkbox(
-        label="Collect all available results",
-        value=False,
-        help="When checked, the app will collect all available results from the search provider.",
-        key="collect_all",
-    )
-
-    requested_results = st.number_input(
-        label="Maximum number of articles",
-        min_value=1,
-        max_value=10000,
-        value=10,
-        step=10,
-        help=(
-            "The application stops when it reaches this number "
-            "or when the search provider has no more results."
-        ),
-        key="requested_results",
-    )
+    
 
     with st.expander("Advanced settings"):
 
@@ -899,6 +1224,17 @@ with st.form("article_search_form"):
         # SSL verification is disabled by default for easier use in
         # corporate or restricted networks; proxy and diagnostics are
         # disabled.
+
+    # AI summary settings
+    generate_summaries = st.checkbox(
+        label="Generate AI summaries for each article",
+        value=False,
+        help="Enable to generate a short 2-3 sentence summary for each collected article.",
+        key="generate_summaries",
+    )
+
+    # Gemini API key and model are read from backend secrets/environment only.
+    # See .streamlit/secrets.toml or the GEMINI_API_KEY/GEMINI_MODEL environment variables.
 
     search_button = st.form_submit_button(
         label="Search articles",
@@ -940,7 +1276,7 @@ if search_button:
                 # (results, query_used, fallback_used).
                 keyword_input = ", ".join(keyword_terms)
 
-                max_results = None if collect_all else int(requested_results)
+                max_results = None if st.session_state.get("results_mode", "Get all results") == "Get all results" else int(requested_results)
 
                 results, query_used, fallback_used = bing.search_articles(
                     subject=subject,
@@ -952,9 +1288,74 @@ if search_button:
                     show_debug=False,
                 )
 
+                # Filter out MSN-hosted or MSN-sourced articles to avoid poor AI summaries
+                try:
+                    original_count = len(results)
+                    results = [r for r in results if not is_msn_result(r)]
+                    filtered_count = original_count - len(results)
+                except Exception:
+                    # If filtering fails for any reason, continue with unfiltered results.
+                    pass
+
                 # Preserve the original name for downstream UI logic.
                 st.session_state["search_query"] = query_used
                 st.session_state["fallback_used"] = fallback_used
+
+                # Optionally generate AI summaries if the user enabled them.
+                try:
+                    if st.session_state.get("generate_summaries", False) and results:
+                        # Read API key and model from Streamlit secrets or environment variables.
+                        api_key = ""
+                        if hasattr(st, "secrets"):
+                            api_key = st.secrets.get("GEMINI_API_KEY", "")
+                            model = st.secrets.get("GEMINI_MODEL", "models/text-bison-001")
+                        else:
+                            import os as _os
+
+                            api_key = _os.environ.get("GEMINI_API_KEY", "")
+                            model = _os.environ.get("GEMINI_MODEL", "models/text-bison-001")
+
+                        for r in results:
+                            # Try to fetch full article content and summarize that.
+                            article_url = r.get("link", "")
+                            article_text = ""
+                            try:
+                                article_text = fetch_article_text(article_url, verify_ssl=False)
+                            except Exception:
+                                article_text = ""
+
+                            if article_text:
+                                text_to_summarize = article_text
+                            else:
+                                # Clean snippet to remove trailing ellipses added by RSS providers
+                                snippet = r.get("snippet", "") or ""
+                                snippet = clean_text(strip_trailing_ellipsis(snippet))
+                                text_to_summarize = "\n".join([r.get("title", ""), snippet])
+
+                            try:
+                                if api_key and article_text:
+                                    # Prefer summarizing full article via API when available.
+                                    r["summary"] = summarize_with_gemini(text_to_summarize, api_key=api_key, model=model)
+                                else:
+                                    r["summary"] = simple_local_summary(text_to_summarize)
+                            except Exception:
+                                # If summarization API fails, fall back to heuristic summary
+                                r["summary"] = simple_local_summary(text_to_summarize)
+
+                            # Post-process summary: remove trailing ellipses and normalize punctuation
+                            try:
+                                s = sanitize_text(r.get("summary", ""))
+                                s = strip_trailing_ellipsis(s)
+                                # Ensure the summary ends with proper punctuation
+                                if s and s[-1] not in ".!?":
+                                    s = s.rstrip(".") + "."
+                                r["summary"] = s
+                            except Exception:
+                                # Keep whatever summary we have if post-processing fails
+                                pass
+                except Exception:
+                    # Keep going even if summaries fail.
+                    pass
 
             st.session_state["search_results"] = results
             st.session_state["search_subject"] = subject
@@ -972,6 +1373,17 @@ if search_button:
 if "search_results" in st.session_state:
 
     results = st.session_state["search_results"]
+    # Re-filter stored results in case any MSN items remained or were added.
+    try:
+        original_count = len(results)
+        results = [r for r in results if not is_msn_result(r)]
+        if len(results) != original_count:
+            removed = original_count - len(results)
+            st.info(f"Filtered out {removed} MSN-hosted result(s) from preview and reporting.")
+        # Keep session state consistent with displayed/used results
+        st.session_state["search_results"] = results
+    except Exception:
+        pass
     search_subject = st.session_state.get(
         "search_subject",
         "search"
@@ -993,6 +1405,8 @@ if "search_results" in st.session_state:
 
         for result, assessment in zip(results, aml_risk_assessments):
             display_result = dict(result)
+            # Ensure summary is present for DataFrame columns.
+            display_result.setdefault("summary", "")
             display_result.update(assessment)
             display_results.append(display_result)
 
@@ -1035,6 +1449,7 @@ if "search_results" in st.session_state:
                     "title",
                     "link",
                     "snippet",
+                    "summary",
                     "keyword_score",
                     "matched_keywords",
                     "risk_level",
@@ -1056,6 +1471,10 @@ if "search_results" in st.session_state:
                 ),
                 "snippet": st.column_config.TextColumn(
                     "Snippet",
+                    width="large"
+                ),
+                "summary": st.column_config.TextColumn(
+                    "AI summary",
                     width="large"
                 ),
                 "keyword_score": st.column_config.NumberColumn(
@@ -1101,59 +1520,63 @@ if "search_results" in st.session_state:
         )
 
         if REPORTLAB_AVAILABLE:
-            if st.button(
-                "Prepare vendor AML screening PDF",
-                key="prepare_vendor_screening_pdf",
-                use_container_width=True,
-            ):
-                try:
-                    with st.spinner("Generating vendor AML screening PDF..."):
-                        st.session_state["vendor_screening_pdf"] = (
-                            generate_vendor_screening_pdf(
-                                subject=search_subject,
-                                results=results,
-                                assessments=aml_risk_assessments,
+                # Show the prepare button only if no PDF is currently prepared.
+                if "vendor_screening_pdf" not in st.session_state:
+                    if st.button(
+                        "Prepare vendor AML screening PDF",
+                        key="prepare_vendor_screening_pdf",
+                        use_container_width=True,
+                    ):
+                        try:
+                            with st.spinner("Generating vendor AML screening PDF..."):
+                                st.session_state["vendor_screening_pdf"] = (
+                                    generate_vendor_screening_pdf(
+                                        subject=search_subject,
+                                        results=results,
+                                        assessments=aml_risk_assessments,
+                                        include_ai_summary=st.session_state.get("generate_summaries", False),
+                                    )
+                                )
+                            st.session_state["vendor_screening_pdf_subject"] = (
+                                search_subject
                             )
-                        )
-                    st.session_state["vendor_screening_pdf_subject"] = (
-                        search_subject
-                    )
-                except Exception as exc:
-                    st.error(f"Unable to generate the PDF report: {exc}")
+                        except Exception as exc:
+                            st.error(f"Unable to generate the PDF report: {exc}")
 
-            if "vendor_screening_pdf" in st.session_state:
-                pdf_filename = (
-                    f"{safe_filename(search_subject)}_"
-                    "vendor_aml_screening.pdf"
-                )
-                st.download_button(
-                    label="⬇️ Download vendor AML screening PDF",
-                    data=st.session_state["vendor_screening_pdf"],
-                    file_name=pdf_filename,
-                    mime="application/pdf",
-                    type="primary",
-                    use_container_width=True,
-                )
+                # If a PDF is available, show only the download control and hide the prepare button.
+                if "vendor_screening_pdf" in st.session_state:
+                    pdf_filename = (
+                        f"{safe_filename(search_subject)}_"
+                        "vendor_aml_screening.pdf"
+                    )
+                    st.download_button(
+                        label="⬇️ Download vendor AML screening PDF",
+                        data=st.session_state["vendor_screening_pdf"],
+                        file_name=pdf_filename,
+                        mime="application/pdf",
+                        type="primary",
+                        use_container_width=True,
+                    )
         else:
             st.warning(
                 "PDF generation is unavailable because ReportLab is not "
                 "installed in the application environment."
             )
 
-        csv_data = convert_results_to_csv(results)
+        # csv_data = convert_results_to_csv(results)
 
-        csv_filename = (
-            f"{safe_filename(search_subject)}_article_results.csv"
-        )
+        # csv_filename = (
+        #     f"{safe_filename(search_subject)}_article_results.csv"
+        # )
 
-        st.download_button(
-            label="⬇️ Download results as CSV",
-            data=csv_data,
-            file_name=csv_filename,
-            mime="text/csv",
-            type="primary",
-            use_container_width=True,
-        )
+        # st.download_button(
+        #     label="⬇️ Download results as CSV",
+        #     data=csv_data,
+        #     file_name=csv_filename,
+        #     mime="text/csv",
+        #     type="primary",
+        #     use_container_width=True,
+        # )
 
         st.markdown(
             """
@@ -1195,11 +1618,17 @@ if "search_results" in st.session_state:
                 )
 
                 st.markdown(
-                    f"{result['link']}"
+                    f"[Open article]({result['link']})"
                 )
 
-                if result["snippet"]:
-                    st.write(result["snippet"])
+                # Display either AI summary or snippet depending on user selection
+                if st.session_state.get("generate_summaries", False):
+                    if result.get("summary"):
+                        st.info(result.get("summary"))
+                else:
+                    snippet_text = prepare_snippet_for_display(result.get("snippet", "") or "")
+                    if snippet_text:
+                        st.write(snippet_text)
 
                 if result["matched_keywords"]:
                     st.caption(
