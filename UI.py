@@ -976,18 +976,52 @@ def simple_local_summary(text: str, max_sentences: int = 3) -> str:
     return summary
 
 
-def summarize_with_gemini(text: str, api_key: str, model: str = "models/gemini-3.5-flash-lite", timeout: int = 15) -> str:
-    """Call a Vertex/Gemini-style REST endpoint to generate a concise summary.
+def get_gemini_configuration() -> tuple[str, str]:
+    """Read the Gemini API key and model from Streamlit secrets or the environment."""
+    import os as _os
 
-    This implementation uses the Google Generative Language REST pattern:
-    POST https://generativelanguage.googleapis.com/v1beta2/{model}:generateText
+    api_key = ""
+    model = "gemini-2.5-flash-lite"
 
-    If the request fails or the response shape is unexpected, an exception is raised.
+    try:
+        secrets = st.secrets
+        api_key = str(secrets.get("GEMINI_API_KEY", "") or "").strip()
+        model = str(secrets.get("GEMINI_MODEL", model) or model).strip()
+    except Exception:
+        # A local run may not have a .streamlit/secrets.toml file.
+        pass
+
+    if not api_key:
+        api_key = _os.environ.get("GEMINI_API_KEY", "").strip()
+    env_model = _os.environ.get("GEMINI_MODEL", "").strip()
+    if env_model:
+        model = env_model
+
+    # Accept either "gemini-2.5-flash-lite" or "models/gemini-2.5-flash-lite".
+    if model.startswith("models/"):
+        model = model.split("/", 1)[1]
+
+    # Migrate the model names used by the old implementation automatically.
+    if model in {"text-bison-001", "gemini-3.5-flash-lite"}:
+        model = "gemini-2.5-flash-lite"
+
+    return api_key, model or "gemini-2.5-flash-lite"
+
+
+def summarize_with_gemini(text: str, api_key: str, model: str = "gemini-2.5-flash-lite", timeout: int = 30) -> str:
+    """Call the current Gemini generateContent REST endpoint.
+
+    The previous implementation used the retired ``v1beta2:generateText``
+    endpoint and Bearer authentication. Gemini API keys now use the
+    ``x-goog-api-key`` header with ``generateContent``.
     """
     if not text:
         return ""
 
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta2/{model}:generateText"
+    model = (model or "gemini-2.5-flash-lite").strip()
+    if model.startswith("models/"):
+        model = model.split("/", 1)[1]
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     # prompt = (
     #     "Provide a concise summary of the following article in 2-3 sentences. "
 
@@ -1013,45 +1047,40 @@ def summarize_with_gemini(text: str, api_key: str, model: str = "models/gemini-3
     
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "x-goog-api-key": api_key,
         "Content-Type": "application/json",
     }
 
     body = {
-        "prompt": {"text": prompt},
-        "temperature": 0.0,
-        "maxOutputTokens": 180,
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 180,
+        },
     }
 
     resp = requests.post(endpoint, headers=headers, json=body, timeout=timeout)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        try:
+            error_payload = resp.json().get("error", {})
+            error_message = error_payload.get("message") or resp.text[:500]
+        except Exception:
+            error_message = resp.text[:500]
+        raise RuntimeError(f"Gemini API error {resp.status_code}: {error_message}")
     data = resp.json()
 
-    # Try common response shapes.
-    # Older PaLM/Generative API used 'candidates'[0]['output'] or 'candidates'[0]['content']
-    if isinstance(data, dict):
-        # 'candidates' style
-        if "candidates" in data and data["candidates"]:
-            first = data["candidates"][0]
-            for key in ("output", "content", "text"):
-                if key in first:
-                    return first[key].strip()
-        # 'results' or 'outputs' style
-        for arr_key in ("results", "outputs"):
-            if arr_key in data and data[arr_key]:
-                first = data[arr_key][0]
-                for key in ("content", "text", "output"):
-                    if key in first:
-                        # some shapes use first['content'][0]['text']
-                        if isinstance(first[key], list) and first[key]:
-                            candidate = first[key][0]
-                            if isinstance(candidate, dict) and "text" in candidate:
-                                return candidate["text"].strip()
-                            return str(candidate).strip()
-                        return str(first[key]).strip()
+    candidates = data.get("candidates", []) if isinstance(data, dict) else []
+    if candidates:
+        parts = candidates[0].get("content", {}).get("parts", [])
+        generated_text = "".join(
+            str(part.get("text", ""))
+            for part in parts
+            if isinstance(part, dict) and part.get("text")
+        ).strip()
+        if generated_text:
+            return generated_text
 
-    # If not returned yet, raise to let caller fallback.
-    raise RuntimeError("Unexpected Gemini response shape: %s" % json.dumps(data)[:1000])
+    raise RuntimeError("Gemini returned no text candidate: %s" % json.dumps(data)[:1000])
 
 
 def fetch_article_text(url: str, verify_ssl: bool = True, timeout: int = 10) -> str:
@@ -1517,7 +1546,10 @@ with filter_column:
         generate_summaries = st.checkbox(
             label="Generate AI summaries for each article",
             value=False,
-            help="Enable to generate a short 2-3 sentence summary for each collected article.",
+            help=(
+                "Enable to generate a short 2-3 sentence summary for each collected article. "
+                "Requires GEMINI_API_KEY in .streamlit/secrets.toml or the environment."
+            ),
             key="generate_summaries",
         )
 
@@ -1582,43 +1614,56 @@ if search_button:
                 st.session_state["search_query"] = query_used
                 st.session_state["fallback_used"] = fallback_used
 
-                try:
-                    if st.session_state.get("generate_summaries", False) and results:
-                        api_key = ""
-                        if hasattr(st, "secrets"):
-                            api_key = st.secrets.get("GEMINI_API_KEY", "")
-                            model = st.secrets.get("GEMINI_MODEL", "models/text-bison-001")
-                        else:
-                            import os as _os
-                            api_key = _os.environ.get("GEMINI_API_KEY", "")
-                            model = _os.environ.get("GEMINI_MODEL", "models/text-bison-001")
+                summary_failures = []
+                if st.session_state.get("generate_summaries", False) and results:
+                    api_key, model = get_gemini_configuration()
 
-                        for result in results:
-                            article_text = ""
-                            try:
-                                article_text = fetch_article_text(result.get("link", ""), verify_ssl=False)
-                            except Exception:
-                                pass
+                    for result in results:
+                        article_text = ""
+                        try:
+                            article_text = fetch_article_text(result.get("link", ""), verify_ssl=False)
+                        except Exception:
+                            pass
 
-                            snippet = clean_text(strip_trailing_ellipsis(result.get("snippet", "") or ""))
-                            text_to_summarize = article_text or "\n".join([result.get("title", ""), snippet])
-                            try:
-                                if api_key and article_text:
-                                    result["summary"] = summarize_with_gemini(text_to_summarize, api_key=api_key, model=model)
-                                else:
-                                    result["summary"] = simple_local_summary(text_to_summarize)
-                            except Exception:
+                        snippet = clean_text(strip_trailing_ellipsis(result.get("snippet", "") or ""))
+                        text_to_summarize = article_text or "\n".join([
+                            result.get("title", "") or "",
+                            snippet,
+                        ])
+                        try:
+                            if api_key:
+                                # Use the article text when available, but still
+                                # call Gemini with title/snippet if the page blocks fetching.
+                                result["summary"] = summarize_with_gemini(
+                                    text_to_summarize,
+                                    api_key=api_key,
+                                    model=model,
+                                )
+                            else:
                                 result["summary"] = simple_local_summary(text_to_summarize)
+                        except Exception as summary_exc:
+                            summary_failures.append(str(summary_exc))
+                            result["summary"] = simple_local_summary(text_to_summarize)
 
-                            try:
-                                summary = strip_trailing_ellipsis(sanitize_text(result.get("summary", "")))
-                                if summary and summary[-1] not in ".!?":
-                                    summary = summary.rstrip(".") + "."
-                                result["summary"] = summary
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+                        try:
+                            summary = strip_trailing_ellipsis(sanitize_text(result.get("summary", "")))
+                            if summary and summary[-1] not in ".!?":
+                                summary = summary.rstrip(".") + "."
+                            result["summary"] = summary
+                        except Exception:
+                            pass
+
+                    if not api_key:
+                        st.warning(
+                            "AI summaries are enabled, but GEMINI_API_KEY is not configured. "
+                            "Add it to .streamlit/secrets.toml or your environment, "
+                            "then restart Streamlit. Showing local summaries instead."
+                        )
+                    elif summary_failures:
+                        st.warning(
+                            "Gemini could not summarize some articles, so local summaries were "
+                            f"used instead. First error: {summary_failures[0]}"
+                        )
 
             st.session_state["search_results"] = results
             st.session_state["search_subject"] = subject
