@@ -1,0 +1,8 @@
+reportlab
+pandas
+requests
+beautifulsoup4
+streamlit
+urllib3
+bs4
+langdetect

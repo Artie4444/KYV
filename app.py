@@ -10,6 +10,7 @@ import requests
 import streamlit as st
 import urllib3
 from bs4 import BeautifulSoup
+import bing
 
 try:
     from reportlab.lib import colors
@@ -37,7 +38,7 @@ except ImportError:
 # ============================================================
 
 st.set_page_config(
-    page_title="Online Article Search",
+    page_title="Online Adverse News Search",
     page_icon="🔎",
     layout="wide"
 )
@@ -796,141 +797,7 @@ def generate_vendor_screening_pdf(
     return buffer.getvalue()
 
 
-def answer_article_question(
-    question: str,
-    results: list[dict]
-) -> tuple[str, list[dict]]:
-    """
-    Find the article titles and snippets most relevant to a user's question.
-
-    This is a local retrieval assistant: it does not fetch linked articles
-    or make claims beyond the collected search-result metadata.
-    """
-    question_terms = {
-        term
-        for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", question.casefold())
-        if len(term) > 2 and term not in CHAT_STOP_WORDS
-    }
-
-    if not question_terms:
-        sample_results = results[:MAXIMUM_CHAT_ARTICLES]
-        return (
-            f"The search collected {len(results):,} articles. Ask about a "
-            "topic, person, organization, or risk keyword to find the most "
-            "relevant results. Here is a sample of the collected articles.",
-            sample_results,
-        )
-
-    ranked_results = []
-
-    for index, result in enumerate(results):
-        title = result["title"].casefold()
-        snippet = result["snippet"].casefold()
-        matching_terms = [
-            term
-            for term in question_terms
-            if term in title or term in snippet
-        ]
-
-        if not matching_terms:
-            continue
-
-        score = sum(
-            3 if term in title else 1
-            for term in matching_terms
-        )
-
-        ranked_results.append(
-            (score, len(matching_terms), -index, result)
-        )
-
-    ranked_results.sort(reverse=True)
-    best_results = [
-        item[3]
-        for item in ranked_results[:MAXIMUM_CHAT_ARTICLES]
-    ]
-
-    if not best_results:
-        return (
-            "I could not find a direct match for that question in the "
-            f"titles and snippets of the {len(results):,} collected articles. "
-            "Try a company name, person, location, or risk keyword.",
-            [],
-        )
-
-    return (
-        f"I found {len(ranked_results):,} article(s) whose title or snippet "
-        "matches your question. The most relevant results are below. "
-        "Please open the sources to verify the full context.",
-        best_results,
-    )
-
-
-def display_article_chat_exchange(message: dict) -> None:
-    """
-    Render one Article Assistant question, answer, and supporting results.
-    """
-    st.markdown("**You**")
-    st.write(message["question"])
-    st.markdown("**Article Assistant**")
-    st.write(message["answer"])
-
-    for index, result in enumerate(message["sources"], start=1):
-        st.write(f"{index}. {result['title']}")
-
-        if result["snippet"]:
-            st.caption(result["snippet"])
-
-        st.markdown(result["link"])
-
-    st.divider()
-
-
-def render_article_assistant(results: list[dict]) -> None:
-    """
-    Render the Article Assistant conversation controls and history.
-    """
-    st.caption(
-        "Ask about the collected results. The assistant uses only the "
-        "displayed titles, snippets, and links; open the sources to verify "
-        "the full context."
-    )
-
-    chat_history = st.session_state.setdefault(
-        "article_chat_history",
-        []
-    )
-
-    for message in chat_history:
-        display_article_chat_exchange(message)
-
-    with st.form("article_assistant_form", clear_on_submit=True):
-        article_question = st.text_input(
-            label="Ask a question about these articles",
-            placeholder=(
-                "Example: Which articles mention money laundering?"
-            ),
-        )
-        ask_article_assistant = st.form_submit_button(
-            label="Ask Article Assistant",
-            use_container_width=True,
-        )
-
-    if ask_article_assistant:
-        if not article_question.strip():
-            st.warning("Enter a question before asking the assistant.")
-        else:
-            answer, sources = answer_article_question(
-                question=article_question,
-                results=results,
-            )
-            new_message = {
-                "question": article_question,
-                "answer": answer,
-                "sources": sources,
-            }
-            chat_history.append(new_message)
-            display_article_chat_exchange(new_message)
+# Article Assistant removed per user request.
 
 
 def create_session() -> requests.Session:
@@ -1243,6 +1110,7 @@ with st.form("article_search_form"):
             "The application automatically places the subject "
             "inside quotation marks for a more exact search."
         ),
+        key="subject",
     )
 
     selected_keywords = st.multiselect(
@@ -1253,6 +1121,7 @@ with st.form("article_search_form"):
             "Choose the keywords to include in the search. "
             "You can remove any default option or add it back later."
         ),
+        key="selected_keywords",
     )
 
     additional_keywords = st.text_area(
@@ -1264,6 +1133,7 @@ with st.form("article_search_form"):
             "commas, semicolons, or new lines. Multi-word phrases are "
             "automatically searched in quotation marks."
         ),
+        key="additional_keywords",
     )
 
     additional_keyword_terms = parse_additional_keywords(
@@ -1288,31 +1158,29 @@ with st.form("article_search_form"):
         label="Final search query preview",
         value=final_query_preview,
         disabled=True,
+        key="final_query_preview",
     )
 
-    result_mode = st.radio(
-        label="How many results should be collected?",
-        options=[
-            "Collect all available results",
-            "Set a maximum number of results",
-        ],
-        horizontal=True,
+    # Let the user choose to collect all results or enter a maximum.
+    collect_all = st.checkbox(
+        label="Collect all available results",
+        value=False,
+        help="When checked, the app will collect all available results from the search provider.",
+        key="collect_all",
     )
 
-    requested_results = None
-
-    if result_mode == "Set a maximum number of results":
-        requested_results = st.number_input(
-            label="Maximum number of articles",
-            min_value=1,
-            max_value=1000,
-            value=100,
-            step=10,
-            help=(
-                "The application stops when it reaches this number "
-                "or when the search provider has no more results."
-            ),
-        )
+    requested_results = st.number_input(
+        label="Maximum number of articles",
+        min_value=1,
+        max_value=10000,
+        value=10,
+        step=10,
+        help=(
+            "The application stops when it reaches this number "
+            "or when the search provider has no more results."
+        ),
+        key="requested_results",
+    )
 
     with st.expander("Advanced settings"):
 
@@ -1326,22 +1194,19 @@ with st.form("article_search_form"):
                 "A delay reduces request frequency and lowers the "
                 "chance of temporary blocking."
             ),
+            key="delay_seconds",
         )
 
-        disable_ssl_verification = st.checkbox(
-            label="Disable SSL certificate verification",
-            value=False,
-            help=(
-                "Only use this if your organization's network causes "
-                "certificate verification errors. Keeping SSL "
-                "verification enabled is safer."
-            ),
-        )
+        # Advanced options removed for simplicity; sensible defaults used.
+        # SSL verification is disabled by default for easier use in
+        # corporate or restricted networks; proxy and diagnostics are
+        # disabled.
 
     search_button = st.form_submit_button(
         label="Search articles",
         type="primary",
         use_container_width=True,
+        key="search_button",
     )
 
 
@@ -1367,30 +1232,34 @@ if search_button:
         st.subheader("Search query")
         st.code(final_query, language=None)
 
-        if disable_ssl_verification:
-            urllib3.disable_warnings(
-                urllib3.exceptions.InsecureRequestWarning
-            )
+        # SSL verification disabled by default for simplified UX.
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
         try:
             with st.spinner("Searching for articles..."):
 
-                results = search_duckduckgo(
-                    query=final_query,
-                    requested_results=(
-                        int(requested_results)
-                        if requested_results is not None
-                        else None
-                    ),
-                    delay_seconds=float(delay_seconds),
-                    match_keywords=keyword_terms,
-                    verify_ssl=not disable_ssl_verification,
+                # Use the Bing searcher from bing.py. It returns
+                # (results, query_used, fallback_used).
+                keyword_input = ", ".join(keyword_terms)
+
+                max_results = None if collect_all else int(requested_results)
+
+                results, query_used, fallback_used = bing.search_articles(
+                    subject=subject,
+                    keyword_input=keyword_input,
+                    maximum_results=max_results,
+                    # Keep SSL verification disabled for non-technical users.
+                    verify_ssl=False,
+                    use_system_proxy=False,
+                    show_debug=False,
                 )
+
+                # Preserve the original name for downstream UI logic.
+                st.session_state["search_query"] = query_used
+                st.session_state["fallback_used"] = fallback_used
 
             st.session_state["search_results"] = results
             st.session_state["search_subject"] = subject
-            # Start a fresh conversation whenever a new search is completed.
-            st.session_state["article_chat_history"] = []
             st.session_state.pop("vendor_screening_pdf", None)
             st.session_state.pop("vendor_screening_pdf_subject", None)
 
@@ -1618,27 +1487,7 @@ if "search_results" in st.session_state:
             unsafe_allow_html=True,
         )
 
-        if hasattr(st, "popover"):
-            with st.popover(
-                "💬",
-                help="Ask the Article Assistant",
-                use_container_width=False,
-            ):
-                render_article_assistant(results)
-        else:
-            # Fallback for older Streamlit versions that lack st.popover.
-            if st.button(
-                "💬",
-                key="article_assistant_toggle",
-                help="Ask the Article Assistant",
-            ):
-                st.session_state["article_assistant_open"] = not (
-                    st.session_state.get("article_assistant_open", False)
-                )
-
-            if st.session_state.get("article_assistant_open", False):
-                st.subheader("💬 Article Assistant")
-                render_article_assistant(results)
+        # Article Assistant removed.
 
         with st.expander("Preview individual links"):
             for index, result in enumerate(results, start=1):
