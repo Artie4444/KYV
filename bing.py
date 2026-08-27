@@ -5,8 +5,6 @@ from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 import xml.etree.ElementTree as ET
-from bs4 import BeautifulSoup
-# BeautifulSoup removed to keep this module RSS-only
 
 import pandas as pd
 import requests

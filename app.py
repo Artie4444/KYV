@@ -9,7 +9,6 @@ import pandas as pd
 import requests
 import streamlit as st
 import urllib3
-from bs4 import BeautifulSoup
 import bing
 
 try:
@@ -48,16 +47,7 @@ st.set_page_config(
 # APPLICATION CONFIGURATION
 # ============================================================
 
-# DuckDuckGo's HTML search interface is generally easier to parse
-# than its JavaScript-rendered search page.
-SEARCH_URL = "https://html.duckduckgo.com/html/"
-
 REQUEST_TIMEOUT_SECONDS = 30
-DEFAULT_DELAY_SECONDS = 1.5
-
-# Safety limit to prevent an accidental endless search.
-# This only applies when "Collect all available results" is selected.
-MAXIMUM_SAFETY_PAGES = 50
 
 DEFAULT_KEYWORD_OPTIONS = [
     "fraud",
@@ -242,92 +232,6 @@ def build_search_query(subject: str, keyword_expression: str) -> str:
     return quoted_subject
 
 
-def decode_duckduckgo_link(link: str) -> str:
-    """
-    Convert a DuckDuckGo redirect link into the underlying destination URL.
-
-    DuckDuckGo may return links similar to:
-        //duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com
-
-    This function extracts and decodes the 'uddg' destination.
-    """
-    if not link:
-        return ""
-
-    link = html.unescape(link.strip())
-
-    if link.startswith("//"):
-        link = f"https:{link}"
-    elif link.startswith("/"):
-        link = urljoin("https://duckduckgo.com", link)
-
-    parsed = urlparse(link)
-    query_parameters = parse_qs(parsed.query)
-
-    if "uddg" in query_parameters and query_parameters["uddg"]:
-        return unquote(query_parameters["uddg"][0]).strip()
-
-    return link
-
-
-def extract_next_page_params(soup: BeautifulSoup) -> dict | None:
-    """
-    Extract the hidden form fields DuckDuckGo embeds for the "Next" page.
-
-    DuckDuckGo's HTML results page does not support arbitrary offset-based
-    pagination. Each page includes a form (inside an element with the
-    "nav-link" class) whose hidden inputs contain the exact parameters
-    (including an opaque session token) required to fetch the next page.
-    These must be resubmitted as-is rather than recomputed.
-    """
-    next_form = soup.select_one(".nav-link form")
-
-    if next_form is None:
-        return None
-
-    params = {}
-
-    for input_tag in next_form.select("input"):
-        name = input_tag.get("name")
-
-        if not name:
-            continue
-
-        params[name] = input_tag.get("value", "")
-
-    return params or None
-
-
-def extract_result(item: BeautifulSoup) -> dict | None:
-    """
-    Extract title, link, and snippet from one DuckDuckGo result container.
-    """
-    title_tag = item.select_one("a.result__a")
-
-    if title_tag is None:
-        return None
-
-    title = clean_text(title_tag.get_text(" ", strip=True))
-    link = decode_duckduckgo_link(title_tag.get("href", ""))
-
-    snippet_tag = item.select_one(".result__snippet")
-    snippet = (
-        clean_text(snippet_tag.get_text(" ", strip=True))
-        if snippet_tag
-        else ""
-    )
-
-    if not title or not link:
-        return None
-
-    if not link.startswith(("http://", "https://")):
-        return None
-
-    return {
-        "title": title,
-        "link": link,
-        "snippet": snippet,
-    }
 
 
 def calculate_keyword_matches(
@@ -831,213 +735,7 @@ def create_session() -> requests.Session:
     return session
 
 
-def search_duckduckgo(
-    query: str,
-    requested_results: int | None,
-    delay_seconds: float,
-    match_keywords: list[str],
-    verify_ssl: bool = True
-) -> list[dict]:
-    """
-    Search DuckDuckGo HTML results.
 
-    Parameters
-    ----------
-    query:
-        Final search query.
-
-    requested_results:
-        Maximum number of unique results to return.
-        When None, continue until no more new results are found.
-
-    delay_seconds:
-        Delay between page requests.
-
-    match_keywords:
-        Selected and user-added keywords used to score local result matches.
-
-    verify_ssl:
-        Whether to verify SSL certificates.
-
-    Returns
-    -------
-    list[dict]
-        Search results containing title, link and snippet.
-    """
-    session = create_session()
-
-    results = []
-    seen_links = set()
-    previous_page_signature = None
-
-    # The first request just needs the query itself. Every request after
-    # that must reuse the exact hidden form fields DuckDuckGo returned on
-    # the previous page (see extract_next_page_params) rather than a
-    # locally-computed offset, since DuckDuckGo ties pagination to an
-    # opaque per-session token it embeds in that form.
-    next_params = {
-        "q": query,
-        "kl": "wt-wt",
-    }
-
-    progress_bar = st.progress(0)
-    status_placeholder = st.empty()
-
-    for page_number in range(1, MAXIMUM_SAFETY_PAGES + 1):
-
-        if requested_results is not None:
-            if len(results) >= requested_results:
-                break
-
-        params = next_params
-
-        status_placeholder.info(
-            f"Searching page {page_number}. "
-            f"Collected {len(results)} unique results so far."
-        )
-
-        try:
-            response = session.get(
-                SEARCH_URL,
-                params=params,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-                verify=verify_ssl,
-            )
-            response.raise_for_status()
-
-        except requests.exceptions.SSLError as exc:
-            raise RuntimeError(
-                "SSL certificate verification failed. "
-                "If this is caused by your organization's network, "
-                "use the SSL verification option carefully."
-            ) from exc
-
-        except requests.exceptions.Timeout as exc:
-            raise RuntimeError(
-                f"The search request exceeded "
-                f"{REQUEST_TIMEOUT_SECONDS} seconds."
-            ) from exc
-
-        except requests.exceptions.RequestException as exc:
-            raise RuntimeError(
-                f"The search request failed: {exc}"
-            ) from exc
-
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        search_items = soup.select(".result")
-
-        if not search_items:
-            search_items = soup.select(".web-result")
-
-        if not search_items:
-            status_placeholder.warning(
-                "No result containers were found. "
-                "The search provider may have changed its page structure, "
-                "returned no matches, or blocked automated requests."
-            )
-            break
-
-        page_results = []
-
-        for item in search_items:
-            extracted = extract_result(item)
-
-            if extracted is None:
-                continue
-
-            link_key = extracted["link"].strip().casefold()
-
-            if link_key in seen_links:
-                continue
-
-            keyword_score, matched_keywords = calculate_keyword_matches(
-                title=extracted["title"],
-                snippet=extracted["snippet"],
-                keywords=match_keywords,
-            )
-
-            page_results.append(
-                {
-                    "title": extracted["title"],
-                    "link": extracted["link"],
-                    "snippet": extracted["snippet"],
-                    "keyword_score": keyword_score,
-                    "matched_keywords": ", ".join(matched_keywords),
-                    "search_page": page_number,
-                }
-            )
-
-            seen_links.add(link_key)
-
-            if requested_results is not None:
-                if len(results) + len(page_results) >= requested_results:
-                    break
-
-        # Stop if a page produces no additional unique results.
-        if not page_results:
-            status_placeholder.info(
-                "The search returned no additional unique results."
-            )
-            break
-
-        page_signature = tuple(
-            item["link"]
-            for item in page_results
-        )
-
-        # Stop if DuckDuckGo begins repeating the same page.
-        if page_signature == previous_page_signature:
-            status_placeholder.info(
-                "The search provider repeated the previous result page."
-            )
-            break
-
-        previous_page_signature = page_signature
-        results.extend(page_results)
-
-        next_params = extract_next_page_params(soup)
-
-        if next_params is None:
-            status_placeholder.info(
-                "The search provider has no further result pages."
-            )
-            break
-
-        if requested_results is not None:
-            completion = min(
-                len(results) / requested_results,
-                1.0
-            )
-        else:
-            completion = min(
-                page_number / MAXIMUM_SAFETY_PAGES,
-                1.0
-            )
-
-        progress_bar.progress(completion)
-
-        if requested_results is not None:
-            if len(results) >= requested_results:
-                break
-
-        time.sleep(delay_seconds)
-
-    progress_bar.progress(1.0)
-    status_placeholder.empty()
-
-    if requested_results is not None:
-        results = results[:requested_results]
-
-    results.sort(
-        key=lambda item: (
-            item["keyword_score"],
-            len(item["snippet"])
-        ),
-        reverse=True
-    )
-
-    return results
 
 
 def convert_results_to_csv(results: list[dict]) -> bytes:
@@ -1085,7 +783,7 @@ def safe_filename(value: str) -> str:
 # STREAMLIT USER INTERFACE
 # ============================================================
 
-st.title("🔎 Online Article Search")
+st.title("🔎 Online Adverse News Search")
 
 st.write(
     "Search for online articles using a company or subject together "
@@ -1188,7 +886,7 @@ with st.form("article_search_form"):
             label="Delay between search pages, in seconds",
             min_value=0.5,
             max_value=10.0,
-            value=DEFAULT_DELAY_SECONDS,
+            value=1.5,
             step=0.5,
             help=(
                 "A delay reduces request frequency and lowers the "
