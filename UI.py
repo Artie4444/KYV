@@ -1965,7 +1965,7 @@ with results_column:
                 if REPORTLAB_AVAILABLE:
                     if "vendor_screening_pdf" not in st.session_state:
                         if st.button(
-                            "Generate vendor PDF  \nCreate a consolidated PDF report",
+                            "Create a consolidated PDF report",
                             key="prepare_vendor_screening_pdf",
                             type="primary",
                             use_container_width=True,
@@ -1985,7 +1985,7 @@ with results_column:
                         pdf_filename = f"{safe_filename(search_subject)}_vendor_aml_screening.pdf"
                         st.download_button(
                             label=(
-                                "Download vendor PDF  \nCreate a consolidated PDF report"
+                                "Create a consolidated PDF report"
                             ),
                             data=st.session_state["vendor_screening_pdf"],
                             file_name=pdf_filename,
