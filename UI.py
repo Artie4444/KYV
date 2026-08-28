@@ -79,9 +79,9 @@ KYV_HISTORY_DB_PATH = Path(__file__).with_name("kyv_history.db")
 # They indicate screening priority, not proof of wrongdoing or a final vendor
 # onboarding decision.
 HIGH_RISK_AML_KEYWORDS = [
-    "money laundering / aml",
+    "money laundering",
     "terrorist financing",
-    "sanctions / sanctioned",
+    "sanctions",
     "bribery",
     "corruption",
     "fraud",
@@ -91,14 +91,11 @@ HIGH_RISK_AML_KEYWORDS = [
     "drug trafficking",
     "organised crime",
     "tax evasion",
-    "criminal prosecution",
-    "criminal conviction",
-    "criminal investigation",
+    "criminal",
     "forgery",
     "ponzi scheme",
     "financial crime",
     "asset seizure",
-    "criminal charges",
 ]
 
 MEDIUM_RISK_AML_KEYWORDS = [
