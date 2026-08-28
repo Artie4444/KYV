@@ -3,6 +3,7 @@ import html
 import re
 import unicodedata
 import json
+import os
 import sqlite3
 from datetime import datetime
 from io import BytesIO
@@ -13,7 +14,6 @@ import pandas as pd
 import requests
 import streamlit as st
 import urllib3
-import bing
 from bs4 import BeautifulSoup
 
 try:
@@ -55,6 +55,11 @@ st.set_page_config(
 # ============================================================
 
 REQUEST_TIMEOUT_SECONDS = 30
+SERPAPI_SEARCH_URL = "https://serpapi.com/search"
+DEFAULT_SERPAPI_COUNTRY = "us"
+DEFAULT_SERPAPI_LANGUAGE = "en"
+SERPAPI_NEWS_PAGE_SIZE = 100
+MAX_SERPAPI_NEWS_PAGES = 10
 
 # Common question words do not help identify relevant article results.
 CHAT_STOP_WORDS = {
@@ -826,7 +831,7 @@ def generate_vendor_screening_pdf(
         Paragraph(
             f"Screened subject: <b>{pdf_safe_text(subject)}</b><br/>"
             f"Generated: {datetime.now().strftime('%d %b %Y, %H:%M')}<br/>"
-            "Scope: article titles and snippets collected by this search only.",
+            "Scope: articles collected by this search only.",
             styles["VendorReportSubtitle"],
         ),
         Paragraph(
@@ -974,20 +979,12 @@ def generate_vendor_screening_pdf(
             ),
         ]
 
-        # Include either the snippet or the AI summary based on caller preference
+        # Include an AI summary only when the caller explicitly requested it.
+        # Search-result snippets are intentionally omitted from PDF reports.
         if include_ai_summary:
             article_flowables.append(
                 Paragraph(
                     f"<b>AI summary:</b> {pdf_safe_text(result.get('summary', '') or 'No summary generated.')}",
-                    styles["VendorBody"],
-                )
-            )
-        else:
-            snippet_display = prepare_snippet_for_display(result.get('snippet', '') or '') or 'No snippet available.'
-            article_flowables.append(
-                Paragraph(
-                    f"<b>Search-result snippet:</b> "
-                    f"{pdf_safe_text(snippet_display)}",
                     styles["VendorBody"],
                 )
             )
@@ -1075,6 +1072,184 @@ def get_gemini_configuration() -> tuple[str, str]:
         model = "gemini-3.5-flash-lite"
 
     return api_key, model or "gemini-3.5-flash-lite"
+
+
+def get_serpapi_configuration() -> tuple[str, str, str]:
+    """Read SerpApi credentials and Google News locale settings.
+
+    ``SERPAPI_API_KEY`` is required. ``SERPAPI_GL`` and ``SERPAPI_HL`` are
+    optional two-letter Google News country and language codes respectively.
+    Streamlit secrets take precedence over environment variables.
+    """
+    api_key = ""
+    country = DEFAULT_SERPAPI_COUNTRY
+    language = DEFAULT_SERPAPI_LANGUAGE
+
+    try:
+        secrets = st.secrets
+        api_key = str(secrets.get("SERPAPI_API_KEY", "") or "").strip()
+        country = str(secrets.get("SERPAPI_GL", country) or country).strip().lower()
+        language = str(secrets.get("SERPAPI_HL", language) or language).strip().lower()
+    except Exception:
+        # A local run may not have a .streamlit/secrets.toml file.
+        pass
+
+    if not api_key:
+        api_key = os.environ.get("SERPAPI_API_KEY", "").strip()
+    country = os.environ.get("SERPAPI_GL", country).strip().lower() or country
+    language = os.environ.get("SERPAPI_HL", language).strip().lower() or language
+
+    # Google News expects two-letter country/language codes. Fall back to
+    # documented defaults instead of issuing an avoidable API request.
+    if not re.fullmatch(r"[a-z]{2}", country):
+        country = DEFAULT_SERPAPI_COUNTRY
+    if not re.fullmatch(r"[a-z]{2}", language):
+        language = DEFAULT_SERPAPI_LANGUAGE
+
+    return api_key, country, language
+
+
+def search_google_news_articles(
+    query: str,
+    keywords: list[str],
+    api_key: str,
+    country: str,
+    language: str,
+    maximum_results: int | None = None,
+) -> list[dict]:
+    """Return positive Google News hits from SerpApi.
+
+    A limited search keeps requesting Google News result pages until it has the
+    requested number of articles with a configured AML risk indicator. This is
+    deliberately different from limiting the raw results before risk filtering.
+    """
+    if not api_key:
+        raise RuntimeError(
+            "SerpApi is not configured. Add SERPAPI_API_KEY to "
+            ".streamlit/secrets.toml or set it as an environment variable."
+        )
+
+    params = {
+        "engine": "google",
+        "tbm": "nws",
+        "q": query,
+        "gl": country,
+        "hl": language,
+        "api_key": api_key,
+        "output": "json",
+    }
+
+    positive_results = []
+    seen_links = set()
+    current_start = 0
+
+    page_limit = (
+        MAX_SERPAPI_NEWS_PAGES
+        if maximum_results is not None
+        else 1
+    )
+    for _ in range(page_limit):
+        page_params = {
+            **params,
+            "start": current_start,
+            "num": SERPAPI_NEWS_PAGE_SIZE,
+        }
+        try:
+            response = requests.get(
+                SERPAPI_SEARCH_URL,
+                params=page_params,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Unable to reach SerpApi Google News: {exc}") from exc
+        except ValueError as exc:
+            raise RuntimeError("SerpApi returned an invalid JSON response.") from exc
+
+        if not isinstance(payload, dict):
+            raise RuntimeError("SerpApi returned an unexpected response format.")
+
+        api_error = payload.get("error")
+        if api_error:
+            if isinstance(api_error, dict):
+                api_error = api_error.get("message") or json.dumps(api_error)
+            raise RuntimeError(f"SerpApi Google News request failed: {api_error}")
+
+        raw_results = payload.get("news_results", [])
+        if not isinstance(raw_results, list) or not raw_results:
+            break
+
+        page_results = []
+        for item in raw_results:
+            if not isinstance(item, dict):
+                continue
+
+            title = clean_text(str(item.get("title", "") or ""))
+            link = str(item.get("link", "") or "").strip()
+            if not title or not link or link in seen_links:
+                continue
+
+            source_data = item.get("source", {})
+            source = (
+                clean_text(str(source_data.get("name", "") or ""))
+                if isinstance(source_data, dict)
+                else clean_text(str(source_data or ""))
+            )
+            snippet = clean_text(
+                str(item.get("snippet") or item.get("description") or "")
+            )
+            keyword_score, matched_keywords = calculate_keyword_matches(
+                title,
+                snippet,
+                keywords,
+            )
+            normalized_result = {
+                "title": title,
+                "link": link,
+                "snippet": snippet,
+                "source": source,
+                "published_at": str(
+                    item.get("iso_date")
+                    or item.get("published_at")
+                    or item.get("date")
+                    or ""
+                ).strip(),
+                "keyword_score": keyword_score,
+                "matched_keywords": ", ".join(matched_keywords),
+            }
+            seen_links.add(link)
+            if not is_msn_result(normalized_result):
+                page_results.append(normalized_result)
+
+        positive_results.extend(filter_concerning_results(page_results))
+        if (
+            maximum_results is not None
+            and len(positive_results) >= maximum_results
+        ):
+            return positive_results[:maximum_results]
+
+        pagination = payload.get("serpapi_pagination", {})
+        next_link = (
+            pagination.get("next")
+            if isinstance(pagination, dict)
+            else ""
+        )
+        try:
+            next_start = int(
+                parse_qs(urlparse(str(next_link)).query).get("start", [""])[0]
+            )
+        except (TypeError, ValueError):
+            break
+        if next_start <= current_start:
+            break
+        current_start = next_start
+
+    return (
+        positive_results[:maximum_results]
+        if maximum_results is not None
+        else positive_results
+    )
 
 
 def summarize_with_gemini(text: str, api_key: str, model: str = "gemini-3.5-flash-lite", timeout: int = 30) -> str:
@@ -1654,8 +1829,9 @@ with filter_column:
         options=["Get all results", "Limit results"],
         index=0,
         help=(
-            "Choose 'Get all results' to collect everything from the "
-            "search provider, or choose 'Limit results' to enter a maximum."
+            "Choose 'Get all results' to collect all positive hits returned "
+            "on the first SerpApi Google News page, or choose 'Limit results' "
+            "to enter a target number of positive hits."
         ),
         key="results_mode",
     )
@@ -1668,7 +1844,10 @@ with filter_column:
             max_value=10000,
             value=requested_results,
             step=1,
-            help="Default is 10. The search will stop after this number of articles.",
+            help=(
+                "Default is 10. The search fetches additional Google News "
+                "pages until it reaches this number of positive hits."
+            ),
             key="requested_results",
         )
 
@@ -1715,20 +1894,22 @@ if search_button:
 
         try:
             with st.spinner("Searching for articles..."):
-                keyword_input = ", ".join(keyword_terms)
                 max_results = (
                     None
                     if st.session_state.get("results_mode", "Get all results") == "Get all results"
                     else int(requested_results)
                 )
 
-                results, query_used, fallback_used = bing.search_articles(
-                    subject=subject,
-                    keyword_input=keyword_input,
+                serpapi_api_key, serpapi_country, serpapi_language = (
+                    get_serpapi_configuration()
+                )
+                results = search_google_news_articles(
+                    query=final_query,
+                    keywords=keyword_terms,
+                    api_key=serpapi_api_key,
+                    country=serpapi_country,
+                    language=serpapi_language,
                     maximum_results=max_results,
-                    verify_ssl=False,
-                    use_system_proxy=False,
-                    show_debug=False,
                 )
 
                 try:
@@ -1740,8 +1921,13 @@ if search_button:
                 # adverse-news indicator. Unclassified articles are not shown.
                 results = filter_concerning_results(results)
 
-                st.session_state["search_query"] = query_used
-                st.session_state["fallback_used"] = fallback_used
+                if max_results is not None and len(results) < max_results:
+                    st.warning(
+                        f"Only {len(results)} positive hits were available after "
+                        f"checking up to {MAX_SERPAPI_NEWS_PAGES} Google News pages."
+                    )
+
+                st.session_state["search_query"] = final_query
 
                 summary_failures = []
                 if st.session_state.get("generate_summaries", False) and results:
@@ -1796,7 +1982,7 @@ if search_button:
 
                 review_id = save_kyv_review(
                     subject=subject,
-                    query=query_used or final_query,
+                    query=final_query,
                     selected_keywords=selected_keywords,
                     additional_keywords=additional_keywords,
                     results=results,
@@ -2011,7 +2197,7 @@ with results_column:
             st.dataframe(
                 display_dataframe[
                     [
-                        "title", "link", "snippet", "summary", "keyword_score",
+                        "title", "link", "summary", "keyword_score",
                         "matched_keywords", "risk_level", "aml_keyword_flags",
                         "onboarding_recommendation",
                     ]
@@ -2021,7 +2207,6 @@ with results_column:
                 column_config={
                     "title": st.column_config.TextColumn("Title", width="medium"),
                     "link": st.column_config.LinkColumn("Link", display_text="Open article", width="small"),
-                    "snippet": st.column_config.TextColumn("Snippet", width="large"),
                     "summary": st.column_config.TextColumn("AI summary", width="large"),
                     "keyword_score": st.column_config.NumberColumn("Keyword score", format="%d"),
                     "matched_keywords": st.column_config.TextColumn("Matched keywords", width="medium"),
