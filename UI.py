@@ -3,6 +3,7 @@ import html
 import re
 import unicodedata
 import json
+import sqlite3
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -67,54 +68,39 @@ CHAT_STOP_WORDS = {
 }
 MAXIMUM_CHAT_ARTICLES = 5
 
+KYV_HISTORY_DB_PATH = Path(__file__).with_name("kyv_history.db")
+
 # These rules are applied only to the collected article titles and snippets.
 # They indicate screening priority, not proof of wrongdoing or a final vendor
 # onboarding decision.
 HIGH_RISK_AML_KEYWORDS = [
-    "money laundering",
-    "anti-money laundering",
-    "aml",
+    "money laundering / aml",
     "terrorist financing",
-    "financing of terrorism",
-    "sanction",
-    "sanctions",
-    "sanctioned",
-    "sanctions evasion",
-    "proceeds of crime",
+    "sanctions / sanctioned",
+    "bribery",
+    "corruption",
+    "fraud",
+    "embezzlement",
     "terrorism",
     "human trafficking",
     "drug trafficking",
     "organised crime",
-    "organized crime",
     "tax evasion",
     "criminal prosecution",
     "criminal conviction",
     "criminal investigation",
-    "criminal charges",
-    "prosecution",
-    "conviction",
-    "indictment",
-    "arrest",
-    "criminal",
-    "fraud",
-    "corruption",
-    "bribery",
-    "embezzlement",
     "forgery",
     "ponzi scheme",
     "financial crime",
     "asset seizure",
-    "shell company",
-    "regulatory action",
+    "criminal charges",
 ]
 
 MEDIUM_RISK_AML_KEYWORDS = [
     "regulatory investigation",
     "regulatory breach",
     "compliance breach",
-    "investigation",
-    "lawsuit",
-    "litigation",
+    "lawsuit / litigation",
     "whistleblower",
     "misconduct",
     "conflict of interest",
@@ -131,20 +117,14 @@ MEDIUM_RISK_AML_KEYWORDS = [
     "labor violation",
     "workplace misconduct",
     "misrepresentation",
-    "charge",
-    "fine",
-    "penalty",
 ]
 
 LOW_RISK_AML_KEYWORDS = [
     "negative media",
-    "adverse media",
     "customer complaint",
     "service complaint",
     "contract dispute",
     "payment delay",
-    "delayed payment",
-    "late payment",
     "employee grievance",
     "negative review",
     "operational incident",
@@ -152,21 +132,14 @@ LOW_RISK_AML_KEYWORDS = [
     "business dispute",
     "service disruption",
     "minor compliance issue",
-    "minor regulatory issue",
-    "compliant",
-    "dispute",
-    "reputational issue",
-    "customer dissatisfaction",
-    "service issue",
-    "payment issue",
 ]
 
 # The dropdown exposes every tier, while only High-risk terms are selected by
 # default for a conservative first-pass screening query.
 DEFAULT_KEYWORD_OPTIONS = list(dict.fromkeys(
     HIGH_RISK_AML_KEYWORDS
-    + MEDIUM_RISK_AML_KEYWORDS
-    + LOW_RISK_AML_KEYWORDS
+    # + MEDIUM_RISK_AML_KEYWORDS
+    # + LOW_RISK_AML_KEYWORDS
 ))
 
 RISK_LEVEL_ORDER = {
@@ -194,6 +167,102 @@ NO_CONCERNING_ARTICLE_MESSAGE = (
     "No concerning articles found. The collected articles did not match any "
     "High-, Medium-, or Low-risk screening indicator."
 )
+
+
+def initialize_kyv_history_db() -> None:
+    """Create the local SQLite store used for historical KYV reviews."""
+    with sqlite3.connect(KYV_HISTORY_DB_PATH, timeout=10) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS kyv_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                query TEXT NOT NULL,
+                selected_keywords_json TEXT NOT NULL,
+                additional_keywords TEXT NOT NULL,
+                results_json TEXT NOT NULL,
+                result_count INTEGER NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+
+def save_kyv_review(
+    subject: str,
+    query: str,
+    selected_keywords: list[str],
+    additional_keywords: str,
+    results: list[dict],
+) -> int | None:
+    """Persist a completed screening and return its database id."""
+    try:
+        initialize_kyv_history_db()
+        with sqlite3.connect(KYV_HISTORY_DB_PATH, timeout=10) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO kyv_reviews (
+                    created_at, subject, query, selected_keywords_json,
+                    additional_keywords, results_json, result_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now().astimezone().isoformat(timespec="seconds"),
+                    subject.strip(),
+                    query,
+                    json.dumps(selected_keywords, ensure_ascii=False),
+                    additional_keywords or "",
+                    json.dumps(results, ensure_ascii=False, default=str),
+                    len(results),
+                ),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        return None
+
+
+def get_recent_kyv_reviews(limit: int = 8) -> list[dict]:
+    """Return recent review metadata for the left-panel history picker."""
+    try:
+        initialize_kyv_history_db()
+        with sqlite3.connect(KYV_HISTORY_DB_PATH, timeout=10) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT id, created_at, subject, result_count
+                FROM kyv_reviews
+                ORDER BY datetime(created_at) DESC, id DESC
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 50)),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+    except (OSError, sqlite3.Error, ValueError):
+        return []
+
+
+def load_kyv_review(review_id: int) -> dict | None:
+    """Load one historical review, including its stored article results."""
+    try:
+        initialize_kyv_history_db()
+        with sqlite3.connect(KYV_HISTORY_DB_PATH, timeout=10) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                "SELECT * FROM kyv_reviews WHERE id = ?",
+                (int(review_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            review = dict(row)
+            review["selected_keywords"] = json.loads(
+                review.pop("selected_keywords_json") or "[]"
+            )
+            review["results"] = json.loads(review.pop("results_json") or "[]")
+            return review
+    except (OSError, sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 # ============================================================
@@ -981,7 +1050,7 @@ def get_gemini_configuration() -> tuple[str, str]:
     import os as _os
 
     api_key = ""
-    model = "gemini-2.5-flash-lite"
+    model = "gemini-3.5-flash-lite"
 
     try:
         secrets = st.secrets
@@ -997,18 +1066,18 @@ def get_gemini_configuration() -> tuple[str, str]:
     if env_model:
         model = env_model
 
-    # Accept either "gemini-2.5-flash-lite" or "models/gemini-2.5-flash-lite".
+    # Accept either "gemini-3.5-flash-lite" or "models/gemini-3.5-flash-lite".
     if model.startswith("models/"):
         model = model.split("/", 1)[1]
 
     # Migrate the model names used by the old implementation automatically.
     if model in {"text-bison-001", "gemini-3.5-flash-lite"}:
-        model = "gemini-2.5-flash-lite"
+        model = "gemini-3.5-flash-lite"
 
-    return api_key, model or "gemini-2.5-flash-lite"
+    return api_key, model or "gemini-3.5-flash-lite"
 
 
-def summarize_with_gemini(text: str, api_key: str, model: str = "gemini-2.5-flash-lite", timeout: int = 30) -> str:
+def summarize_with_gemini(text: str, api_key: str, model: str = "gemini-3.5-flash-lite", timeout: int = 30) -> str:
     """Call the current Gemini generateContent REST endpoint.
 
     The previous implementation used the retired ``v1beta2:generateText``
@@ -1018,7 +1087,7 @@ def summarize_with_gemini(text: str, api_key: str, model: str = "gemini-2.5-flas
     if not text:
         return ""
 
-    model = (model or "gemini-2.5-flash-lite").strip()
+    model = (model or "gemini-3.5-flash-lite").strip()
     if model.startswith("models/"):
         model = model.split("/", 1)[1]
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -1308,6 +1377,20 @@ st.markdown(
         margin: 4px 0 2px;
     }
     .filter-caption { color: #64748b; font-size: .88rem; margin-bottom: 14px; }
+    .history-heading {
+        color: #334155;
+        font-size: .82rem;
+        font-weight: 750;
+        letter-spacing: .02em;
+        margin: 16px 0 6px;
+        text-transform: uppercase;
+    }
+    .history-caption {
+        color: #64748b;
+        font-size: .75rem;
+        line-height: 1.35;
+        margin-bottom: 6px;
+    }
     .query-preview {
         background: #f8fafc;
         border: 1px solid #cbd5e1;
@@ -1440,125 +1523,171 @@ with filter_column:
         unsafe_allow_html=True,
     )
 
-    with st.form("article_search_form"):
-        subject = st.text_input(
-            label="Company, person, or subject",
-            value="DHL",
-            placeholder="Example: DHL",
-            help=(
-                "The application automatically places the subject "
-                "inside quotation marks for a more exact search."
-            ),
-            key="subject",
-        )
-
-        # Apply the high-only default once so an existing Streamlit session
-        # also picks up the new defaults without resetting later user edits.
-        if st.session_state.get("keyword_defaults_version") != "high_only_v1":
-            st.session_state["selected_keywords"] = list(HIGH_RISK_AML_KEYWORDS)
-            st.session_state["keyword_defaults_version"] = "high_only_v1"
-
-        selected_keywords = st.multiselect(
-            label="Risk keywords",
-            options=DEFAULT_KEYWORD_OPTIONS,
-            default=HIGH_RISK_AML_KEYWORDS,
-            help=(
-                "High-risk keywords are pre-selected. Medium- and Low-risk "
-                "keywords are available in this dropdown if you want to add them."
-            ),
-            key="selected_keywords",
-        )
-
-        additional_keywords = st.text_area(
-            label="Additional keywords (optional)",
-            height=100,
-            placeholder="Example: embezzlement, tax evasion\nshell company",
-            help=(
-                "Add one or more extra keywords or phrases, separated by "
-                "commas, semicolons, or new lines. Multi-word phrases are "
-                "automatically searched in quotation marks."
-            ),
-            key="additional_keywords",
-        )
-
-        additional_keyword_terms = parse_additional_keywords(additional_keywords)
-        keyword_terms = list(dict.fromkeys(selected_keywords + additional_keyword_terms))
-        keyword_expression = build_keyword_expression(keyword_terms)
-
-        final_query_preview = ""
-        try:
-            final_query_preview = build_search_query(
-                subject=subject,
-                keyword_expression=keyword_expression,
+    recent_reviews = get_recent_kyv_reviews()
+    st.markdown('<div class="history-heading">Recent searches</div>', unsafe_allow_html=True)
+    if recent_reviews:
+        history_labels = ["Select a saved review"]
+        history_ids = {history_labels[0]: None}
+        for review in recent_reviews:
+            try:
+                review_time = datetime.fromisoformat(review["created_at"]).strftime(
+                    "%d %b %Y, %H:%M"
+                )
+            except (TypeError, ValueError):
+                review_time = str(review.get("created_at", ""))
+            label = (
+                f"{review['subject']} · {review_time} · "
+                f"{review['result_count']} article(s)"
             )
-        except ValueError:
-            pass
+            history_labels.append(label)
+            history_ids[label] = review["id"]
 
-        st.markdown("**Final query preview**")
-        if final_query_preview:
-            st.markdown(
-                f'<div class="query-preview">{html.escape(final_query_preview)}</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.info("Enter a company, person, or subject to see the final query.")
-
-        results_mode = st.radio(
-            label="Results mode",
-            options=["Get all results", "Limit results"],
-            index=0,
-            help=(
-                "Choose 'Get all results' to collect everything from the "
-                "search provider, or choose 'Limit results' to enter a maximum."
-            ),
-            key="results_mode",
+        selected_history_label = st.selectbox(
+            "Past KYV reviews",
+            options=history_labels,
+            label_visibility="collapsed",
+            key="history_selection",
         )
-
-        requested_results = st.session_state.get("requested_results", 10)
-        if results_mode == "Limit results":
-            requested_results = st.number_input(
-                label="Maximum number of articles",
-                min_value=1,
-                max_value=10000,
-                value=requested_results,
-                step=10,
-                help=(
-                    "The application stops when it reaches this number "
-                    "or when the search provider has no more results."
-                ),
-                key="requested_results",
-            )
-
-        with st.expander("Advanced settings"):
-            delay_seconds = st.number_input(
-                label="Delay between search pages, in seconds",
-                min_value=0.5,
-                max_value=10.0,
-                value=1.5,
-                step=0.5,
-                help=(
-                    "A delay reduces request frequency and lowers the "
-                    "chance of temporary blocking."
-                ),
-                key="delay_seconds",
-            )
-
-        generate_summaries = st.checkbox(
-            label="Generate AI summaries for each article",
-            value=False,
-            help=(
-                "Enable to generate a short 2-3 sentence summary for each collected article. "
-                "Requires GEMINI_API_KEY in .streamlit/secrets.toml or the environment."
-            ),
-            key="generate_summaries",
-        )
-
-        search_button = st.form_submit_button(
-            label="🔍  Search articles",
-            type="primary",
+        if st.button(
+            "Load saved review",
             use_container_width=True,
-            key="search_button",
+            disabled=history_ids[selected_history_label] is None,
+            key="load_kyv_review",
+        ):
+            saved_review = load_kyv_review(history_ids[selected_history_label])
+            if saved_review:
+                saved_keywords = [
+                    keyword
+                    for keyword in saved_review.get("selected_keywords", [])
+                    if keyword in DEFAULT_KEYWORD_OPTIONS
+                ]
+                st.session_state["subject"] = saved_review["subject"]
+                st.session_state["selected_keywords"] = saved_keywords
+                st.session_state["additional_keywords"] = saved_review.get(
+                    "additional_keywords", ""
+                )
+                st.session_state["search_results"] = saved_review.get("results", [])
+                st.session_state["search_subject"] = saved_review["subject"]
+                st.session_state["search_query"] = saved_review.get("query", "")
+                st.session_state.pop("vendor_screening_pdf", None)
+                st.session_state.pop("vendor_screening_pdf_subject", None)
+                st.session_state["history_loaded_notice"] = (
+                    f"Loaded saved KYV review for {saved_review['subject']}."
+                )
+                st.rerun()
+    else:
+        st.markdown(
+            '<div class="history-caption">No saved reviews yet. Completed searches will appear here.</div>',
+            unsafe_allow_html=True,
         )
+
+    history_notice = st.session_state.pop("history_loaded_notice", None)
+    if history_notice:
+        st.success(history_notice)
+
+    subject = st.text_input(
+        label="Company, person, or subject",
+        value="DHL",
+        placeholder="Example: DHL",
+        help=(
+            "The application automatically places the subject "
+            "inside quotation marks for a more exact search."
+        ),
+        key="subject",
+    )
+
+    # Apply the high-only default once so an existing Streamlit session
+    # also picks up the new defaults without resetting later user edits.
+    if st.session_state.get("keyword_defaults_version") != "high_only_v1":
+        st.session_state["selected_keywords"] = list(HIGH_RISK_AML_KEYWORDS)
+        st.session_state["keyword_defaults_version"] = "high_only_v1"
+
+    selected_keywords = st.multiselect(
+        label="Risk keywords",
+        options=DEFAULT_KEYWORD_OPTIONS,
+        default=HIGH_RISK_AML_KEYWORDS,
+        help=(
+            "High-risk keywords are pre-selected. Medium- and Low-risk "
+            "keywords are available in this dropdown if you want to add them."
+        ),
+        key="selected_keywords",
+    )
+
+    additional_keywords = st.text_area(
+        label="Additional keywords (optional)",
+        height=100,
+        placeholder="Example: embezzlement, tax evasion\nshell company",
+        help=(
+            "Add one or more extra keywords or phrases, separated by "
+            "commas, semicolons, or new lines. Multi-word phrases are "
+            "automatically searched in quotation marks."
+        ),
+        key="additional_keywords",
+    )
+
+    additional_keyword_terms = parse_additional_keywords(additional_keywords)
+    keyword_terms = list(dict.fromkeys(selected_keywords + additional_keyword_terms))
+    keyword_expression = build_keyword_expression(keyword_terms)
+
+    final_query_preview = ""
+    try:
+        final_query_preview = build_search_query(
+            subject=subject,
+            keyword_expression=keyword_expression,
+        )
+    except ValueError:
+        pass
+
+    st.markdown("**Final query preview**")
+    if final_query_preview:
+        st.markdown(
+            f'<div class="query-preview">{html.escape(final_query_preview)}</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.info("Enter a company, person, or subject to see the final query.")
+
+    # These controls are intentionally below the query preview and outside a
+    # form so the limit field appears immediately when the mode changes.
+    results_mode = st.radio(
+        label="Results mode",
+        options=["Get all results", "Limit results"],
+        index=0,
+        help=(
+            "Choose 'Get all results' to collect everything from the "
+            "search provider, or choose 'Limit results' to enter a maximum."
+        ),
+        key="results_mode",
+    )
+
+    requested_results = st.session_state.get("requested_results", 10)
+    if results_mode == "Limit results":
+        requested_results = st.number_input(
+            label="Search limit (articles)",
+            min_value=1,
+            max_value=10000,
+            value=requested_results,
+            step=1,
+            help="Default is 10. The search will stop after this number of articles.",
+            key="requested_results",
+        )
+
+    generate_summaries = st.checkbox(
+        label="Generate AI summaries for each article",
+        value=False,
+        help=(
+            "Enable to generate a short 2-3 sentence summary for each collected article. "
+            "Requires GEMINI_API_KEY in .streamlit/secrets.toml or the environment."
+        ),
+        key="generate_summaries",
+    )
+
+    search_button = st.button(
+        label="🔍  Search articles",
+        type="primary",
+        use_container_width=True,
+        key="search_button",
+    )
 
 
 # ============================================================
@@ -1664,6 +1793,20 @@ if search_button:
                             "Gemini could not summarize some articles, so local summaries were "
                             f"used instead. First error: {summary_failures[0]}"
                         )
+
+                review_id = save_kyv_review(
+                    subject=subject,
+                    query=query_used or final_query,
+                    selected_keywords=selected_keywords,
+                    additional_keywords=additional_keywords,
+                    results=results,
+                )
+                if review_id is not None:
+                    st.session_state["last_saved_review_id"] = review_id
+                else:
+                    st.warning(
+                        "The search completed, but this review could not be saved to the local history database."
+                    )
 
             st.session_state["search_results"] = results
             st.session_state["search_subject"] = subject
