@@ -83,9 +83,7 @@ KYV_HISTORY_DB_PATH = Path(__file__).with_name("kyv_history.db")
 # onboarding decision.
 HIGH_RISK_AML_KEYWORDS = [
     "money laundering",
-    "aml",
     "terrorist financing",
-    "sanctioned",
     "sanctions",
     "bribery",
     "corruption",
@@ -101,7 +99,6 @@ HIGH_RISK_AML_KEYWORDS = [
     "ponzi scheme",
     "financial crime",
     "asset seizure",
-    "criminal charges",
 ]
 
 MEDIUM_RISK_AML_KEYWORDS = [
